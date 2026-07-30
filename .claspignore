@@ -1,0 +1,7 @@
+README.md
+SETUP.md
+.git/**
+.github/**
+.clasp.json
+.clasp.json.example
+*.zip
