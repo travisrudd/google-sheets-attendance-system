@@ -15,9 +15,10 @@ In the Apps Script editor:
 
 1. Replace the contents of `Code.gs` with the supplied `Code.gs`.
 2. Add an HTML file named `Index` and paste in `Index.html`.
-3. Open **Project Settings**, enable **Show "appsscript.json" manifest file in
+3. Add another HTML file named `Register` and paste in `Register.html`.
+4. Open **Project Settings**, enable **Show "appsscript.json" manifest file in
    editor**, and replace it with the supplied `appsscript.json`.
-4. Save the project.
+5. Save the project.
 
 ## 3. Initialize the Sheet
 
@@ -30,6 +31,12 @@ The Sheet will now contain `People`, `Attendance`, and `Settings` tabs, plus an
 
 In `Settings`, replace **Attendance Check-In** with the organization or class
 name you want attendees to see. Keep the timezone as `America/Chicago`.
+
+The initializer also adds:
+
+- **Self Registration Enabled** — use `TRUE` or `FALSE`.
+- **Daily Registration Limit** — defaults to `50` successful registrations per
+  Chicago calendar day.
 
 ## 4. Deploy the web app
 
@@ -46,11 +53,53 @@ Copy that working `/exec` URL into the **Web App URL** row in `Settings`. This
 ensures personal links always use the intended deployment when the Apps Script
 project has more than one active deployment.
 
+The general `/exec` URL is now the self-registration page. A URL containing a
+private `?t=...` token remains a person's check-in page.
+
 > If your Google Workspace administrator does not allow public Apps Script web
 > apps, they must enable that option or you must deploy from an account that
 > permits it.
 
-## 5. Register people
+## 5. Configure delivery
+
+### Email
+
+Email uses the Google account that deployed the web app. The first run may ask
+the deployer to approve permission to send email. Google account email quotas
+apply.
+
+### SMS with Twilio
+
+Apps Script does not include native SMS delivery. To enable the Text Message
+choice, create a Twilio account and obtain an SMS-capable Twilio number. Then in
+Apps Script open **Project Settings → Script properties** and add these exact
+properties:
+
+| Property | Value |
+|---|---|
+| `TWILIO_ACCOUNT_SID` | Twilio Account SID |
+| `TWILIO_AUTH_TOKEN` | Twilio Auth Token |
+| `TWILIO_FROM_NUMBER` | Twilio number in E.164 format, such as `+13125551234` |
+
+Do not put these credentials in the Sheet or source code. Twilio messaging fees,
+trial-account restrictions, carrier rules, and consent requirements apply.
+
+If these properties are absent, the registration page tells users that SMS is
+not configured and asks them to choose email.
+
+## 6. Self-registration
+
+1. Share the general `/exec` URL, or use **Attendance System → Show
+   self-registration link**.
+2. The attendee enters their name and chooses email or text delivery.
+3. The server validates the information, checks for an existing email/phone,
+   creates the Person ID and token, and adds the person to `People`.
+4. Their private link and setup instructions are delivered automatically.
+
+The `People` sheet now includes **Email** and **Delivery Method** columns. A
+duplicate email address or mobile number is not registered again.
+
+## 7. Register people manually
 
 1. In the `People` sheet, enter each attendee's **Name** and **Phone** on a new
    row. Leave all other columns blank.
@@ -63,7 +112,7 @@ Opening a personal link shows the attendee's name, today's Chicago date, and one
 **Check In** button. The link works on iPhone, Android, tablets, and computers.
 Attendees can add it to their Home Screen.
 
-## 6. Day-to-day use
+## 8. Day-to-day use
 
 - Each person can check in once per Chicago calendar date.
 - Repeat attempts show **You already checked in today**.
@@ -85,6 +134,11 @@ After changing code in Apps Script:
 3. Select **New version** and deploy.
 
 The personal `/exec` links remain the same.
+
+When upgrading from the original version, add `Register.html`, replace
+`Code.gs`, run `initializeAttendanceSystem` again, and deploy a **New version**
+of the existing web-app deployment. Existing people, tokens, attendance, and
+personal links are preserved.
 
 ## Optional: sync GitHub with Apps Script using clasp
 

@@ -17,6 +17,8 @@ const APP = Object.freeze({
     'Active',
     'Personal Link',
     'Created At',
+    'Email',
+    'Delivery Method',
   ],
   ATTENDANCE_HEADERS: [
     'Attendance ID',
@@ -31,6 +33,8 @@ const APP = Object.freeze({
     ['Organization Name', 'Attendance Check-In'],
     ['Timezone', 'America/Chicago'],
     ['Web App URL', ''],
+    ['Self Registration Enabled', 'TRUE'],
+    ['Daily Registration Limit', '50'],
   ],
 });
 
@@ -41,6 +45,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Set up new people', 'setupNewPeople')
     .addItem('Refresh personal links', 'refreshPersonalLinks')
+    .addItem('Show self-registration link', 'showRegistrationLink')
     .addSeparator()
     .addItem('Rebuild annual reports', 'rebuildAllAnnualReports')
     .addToUi();
@@ -146,8 +151,22 @@ function refreshPersonalLinks() {
   toast_(updated + ' personal link(s) refreshed.');
 }
 
+function showRegistrationLink() {
+  const webAppUrl = getWebAppUrl_();
+  if (!webAppUrl) {
+    throw new Error('Add the deployed /exec URL to Settings → Web App URL first.');
+  }
+  SpreadsheetApp.getUi().alert(
+    'Self-registration link',
+    webAppUrl,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
 function doGet(event) {
   const token = String((event && event.parameter && event.parameter.t) || '').trim();
+  if (!token) return renderRegistrationPage_();
+
   const person = token ? findPersonByToken_(token) : null;
   const template = HtmlService.createTemplateFromFile('Index');
   const timezone = getSetting_('Timezone', 'America/Chicago');
@@ -173,6 +192,131 @@ function doGet(event) {
     .setTitle(template.organizationName)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.DEFAULT);
+}
+
+function renderRegistrationPage_() {
+  const template = HtmlService.createTemplateFromFile('Register');
+  template.organizationName = getSetting_(
+    'Organization Name',
+    'Attendance Check-In'
+  );
+  template.registrationEnabled = toBoolean_(
+    getSetting_('Self Registration Enabled', 'TRUE')
+  );
+  template.smsEnabled = hasTwilioConfiguration_();
+
+  return template
+    .evaluate()
+    .setTitle('Register · ' + template.organizationName)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.DEFAULT);
+}
+
+function registerPerson(payload) {
+  payload = payload || {};
+  if (String(payload.website || '').trim()) {
+    return registrationFailure_('We could not complete your registration.');
+  }
+  if (!toBoolean_(getSetting_('Self Registration Enabled', 'TRUE'))) {
+    return registrationFailure_('Self-registration is currently closed.');
+  }
+
+  const name = normalizeName_(payload.name);
+  const method = String(payload.deliveryMethod || '').toLowerCase();
+  const email = normalizeEmail_(payload.email);
+  const phone = normalizePhone_(payload.phone);
+
+  if (!name) {
+    return registrationFailure_('Enter your full name using letters, spaces, apostrophes, or hyphens.');
+  }
+  if (method !== 'email' && method !== 'sms') {
+    return registrationFailure_('Choose email or text message delivery.');
+  }
+  if (method === 'email' && !isValidEmail_(email)) {
+    return registrationFailure_('Enter a valid email address.');
+  }
+  if (method === 'sms' && !isValidPhone_(phone)) {
+    return registrationFailure_(
+      'Enter a valid mobile number, including the country code when outside the U.S.'
+    );
+  }
+
+  const configurationError = getDeliveryConfigurationError_(method);
+  if (configurationError) return registrationFailure_(configurationError);
+
+  const lock = LockService.getScriptLock();
+  let createdRow = 0;
+  try {
+    lock.waitLock(30000);
+    enforceDailyRegistrationLimit_();
+
+    const sheet = getSpreadsheet_().getSheetByName(APP.PEOPLE_SHEET);
+    const values = sheet.getLastRow() > 1
+      ? sheet.getRange(2, 1, sheet.getLastRow() - 1, APP.PEOPLE_HEADERS.length).getValues()
+      : [];
+
+    if (findDuplicateRegistration_(values, email, phone)) {
+      return registrationFailure_(
+        'An account already exists for that email address or mobile number. Please contact an administrator if you need your link resent.'
+      );
+    }
+
+    const webAppUrl = getWebAppUrl_();
+    if (!webAppUrl) {
+      return registrationFailure_('Registration is not fully configured. Please contact an administrator.');
+    }
+
+    const personId = 'P' + String(getNextPersonNumber_(values)).padStart(4, '0');
+    const token = createToken_();
+    const personalLink = buildPersonalLink_(webAppUrl, token);
+    const now = new Date();
+    sheet.appendRow([
+      personId,
+      name,
+      phone,
+      token,
+      true,
+      personalLink,
+      now,
+      email,
+      method === 'sms' ? 'SMS' : 'Email',
+    ]);
+    createdRow = sheet.getLastRow();
+    formatPeopleSheet_(sheet);
+
+    sendRegistrationLink_({
+      method: method,
+      name: name,
+      email: email,
+      phone: phone,
+      personalLink: personalLink,
+    });
+    incrementDailyRegistrationCount_();
+
+    return {
+      ok: true,
+      message: method === 'sms'
+        ? 'Your personal check-in link was sent by text message.'
+        : 'Your personal check-in link was sent by email.',
+      destination: method === 'sms' ? maskPhone_(phone) : maskEmail_(email),
+    };
+  } catch (error) {
+    console.error(error);
+    if (createdRow) {
+      try {
+        getSpreadsheet_().getSheetByName(APP.PEOPLE_SHEET).deleteRow(createdRow);
+      } catch (rollbackError) {
+        console.error(rollbackError);
+      }
+    }
+    return registrationFailure_(
+      error && error.message
+        ? error.message
+        : 'We could not complete your registration. Please try again.'
+    );
+  } finally {
+    if (lock.hasLock()) lock.releaseLock();
+  }
 }
 
 function checkIn(token) {
@@ -431,13 +575,195 @@ function buildPersonalLink_(webAppUrl, token) {
   return webAppUrl + '?t=' + encodeURIComponent(token);
 }
 
+function sendRegistrationLink_(registration) {
+  if (registration.method === 'sms') {
+    sendWelcomeSms_(registration);
+  } else {
+    sendWelcomeEmail_(registration);
+  }
+}
+
+function sendWelcomeEmail_(registration) {
+  const organizationName = getSetting_('Organization Name', 'Attendance Check-In');
+  const safeName = escapeHtml_(registration.name);
+  const safeOrganization = escapeHtml_(organizationName);
+  const safeLink = escapeHtml_(registration.personalLink);
+  const subject = 'Your ' + organizationName + ' check-in link';
+  const plainBody = [
+    'Hi ' + registration.name + ',',
+    '',
+    'Here is your private ' + organizationName + ' check-in link:',
+    registration.personalLink,
+    '',
+    'Keep this link private. Open it when you arrive and tap Check In.',
+    '',
+    'Save it for next time:',
+    '• iPhone/iPad: open in Safari, tap Share, then Add to Home Screen or Add Bookmark.',
+    '• Android: open in Chrome, open the menu, then Add to Home screen or Bookmark.',
+    '• Computer: bookmark the page in your browser.',
+  ].join('\n');
+  const htmlBody =
+    '<p>Hi ' + safeName + ',</p>' +
+    '<p>Here is your private <strong>' + safeOrganization + '</strong> check-in link:</p>' +
+    '<p><a href="' + safeLink + '" style="display:inline-block;padding:12px 18px;' +
+    'background:#1769aa;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold">' +
+    'Open my check-in page</a></p>' +
+    '<p><strong>Keep this link private.</strong> Open it when you arrive and tap Check In.</p>' +
+    '<h3>Save it for next time</h3>' +
+    '<ul><li><strong>iPhone/iPad:</strong> open in Safari, tap Share, then Add to Home Screen or Add Bookmark.</li>' +
+    '<li><strong>Android:</strong> open in Chrome, open the menu, then Add to Home screen or Bookmark.</li>' +
+    '<li><strong>Computer:</strong> bookmark the page in your browser.</li></ul>';
+
+  MailApp.sendEmail({
+    to: registration.email,
+    subject: subject,
+    body: plainBody,
+    htmlBody: htmlBody,
+    name: organizationName,
+  });
+}
+
+function sendWelcomeSms_(registration) {
+  const properties = PropertiesService.getScriptProperties();
+  const accountSid = properties.getProperty('TWILIO_ACCOUNT_SID');
+  const authToken = properties.getProperty('TWILIO_AUTH_TOKEN');
+  const fromNumber = properties.getProperty('TWILIO_FROM_NUMBER');
+  const organizationName = getSetting_('Organization Name', 'Attendance Check-In');
+  const message =
+    organizationName + ': Your private check-in link is ' + registration.personalLink +
+    ' — save or bookmark it, then open it and tap Check In when you arrive.';
+
+  const response = UrlFetchApp.fetch(
+    'https://api.twilio.com/2010-04-01/Accounts/' + encodeURIComponent(accountSid) + '/Messages.json',
+    {
+      method: 'post',
+      payload: {
+        To: registration.phone,
+        From: fromNumber,
+        Body: message,
+      },
+      headers: {
+        Authorization: 'Basic ' + Utilities.base64Encode(accountSid + ':' + authToken),
+      },
+      muteHttpExceptions: true,
+    }
+  );
+
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
+    console.error('Twilio error ' + response.getResponseCode() + ': ' + response.getContentText());
+    throw new Error('The text message could not be sent. Please try email or contact an administrator.');
+  }
+}
+
+function getDeliveryConfigurationError_(method) {
+  if (method === 'email') {
+    return MailApp.getRemainingDailyQuota() > 0
+      ? ''
+      : 'Email delivery is temporarily unavailable. Please contact an administrator.';
+  }
+
+  return hasTwilioConfiguration_()
+    ? ''
+    : 'Text-message delivery is not configured yet. Please choose email or contact an administrator.';
+}
+
+function hasTwilioConfiguration_() {
+  const properties = PropertiesService.getScriptProperties();
+  return Boolean(
+    properties.getProperty('TWILIO_ACCOUNT_SID') &&
+    properties.getProperty('TWILIO_AUTH_TOKEN') &&
+    properties.getProperty('TWILIO_FROM_NUMBER')
+  );
+}
+
+function findDuplicateRegistration_(values, email, phone) {
+  return values.some(function (row) {
+    const existingPhone = normalizePhone_(row[2]);
+    const existingEmail = normalizeEmail_(row[7]);
+    return Boolean(
+      (email && existingEmail && email === existingEmail) ||
+      (phone && existingPhone && phone === existingPhone)
+    );
+  });
+}
+
+function enforceDailyRegistrationLimit_() {
+  const limit = Math.max(
+    1,
+    Number(getSetting_('Daily Registration Limit', '50')) || 50
+  );
+  const key = getDailyRegistrationCounterKey_();
+  const count = Number(PropertiesService.getScriptProperties().getProperty(key) || 0);
+  if (count >= limit) {
+    throw new Error('Registration is temporarily unavailable. Please contact an administrator.');
+  }
+}
+
+function incrementDailyRegistrationCount_() {
+  const properties = PropertiesService.getScriptProperties();
+  const key = getDailyRegistrationCounterKey_();
+  const count = Number(properties.getProperty(key) || 0);
+  properties.setProperty(key, String(count + 1));
+}
+
+function getDailyRegistrationCounterKey_() {
+  const timezone = getSetting_('Timezone', 'America/Chicago');
+  return 'REGISTRATION_COUNT_' + Utilities.formatDate(new Date(), timezone, 'yyyyMMdd');
+}
+
 function dateAtNoon_(dateKey) {
   const parts = dateKey.split('-').map(Number);
   return new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0);
 }
 
 function normalizePhone_(value) {
-  return String(value || '').trim();
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10) return '+1' + digits;
+  if (digits.length === 11 && digits.charAt(0) === '1') return '+' + digits;
+  return raw.charAt(0) === '+' ? '+' + digits : digits;
+}
+
+function normalizeEmail_(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeName_(value) {
+  const name = String(value || '').trim().replace(/\s+/g, ' ');
+  return /^[\p{L}\p{M}][\p{L}\p{M}\s.'’\-]{0,99}$/u.test(name) ? name : '';
+}
+
+function isValidEmail_(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
+
+function isValidPhone_(phone) {
+  return /^\+[1-9]\d{7,14}$/.test(phone);
+}
+
+function maskEmail_(email) {
+  const parts = email.split('@');
+  if (parts.length !== 2) return email;
+  const local = parts[0];
+  return local.charAt(0) + '***@' + parts[1];
+}
+
+function maskPhone_(phone) {
+  return phone.length > 4 ? '•••' + phone.slice(-4) : phone;
+}
+
+function escapeHtml_(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function registrationFailure_(message) {
+  return { ok: false, message: message, destination: '' };
 }
 
 function toBoolean_(value) {
@@ -465,9 +791,11 @@ function formatPeopleSheet_(sheet) {
   sheet.setColumnWidth(2, 220);
   sheet.setColumnWidth(4, 320);
   sheet.setColumnWidth(6, 420);
+  sheet.setColumnWidth(8, 240);
   sheet.getRange('C:C').setNumberFormat('@');
   sheet.getRange('D:D').setNumberFormat('@');
   sheet.getRange('G:G').setNumberFormat('yyyy-mm-dd h:mm AM/PM');
+  sheet.getRange('H:H').setNumberFormat('@');
 }
 
 function formatAttendanceSheet_(sheet) {
