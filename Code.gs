@@ -255,9 +255,20 @@ function registerPerson(payload) {
       ? sheet.getRange(2, 1, sheet.getLastRow() - 1, APP.PEOPLE_HEADERS.length).getValues()
       : [];
 
-    if (findDuplicateRegistration_(values, email, phone)) {
+    const registrationConflict = findRegistrationConflict_(
+      values,
+      name,
+      email,
+      phone
+    );
+    if (registrationConflict === 'contact') {
       return registrationFailure_(
         'An account already exists for that email address or mobile number. Please contact an administrator if you need your link resent.'
+      );
+    }
+    if (registrationConflict === 'name') {
+      return registrationFailure_(
+        'Someone with that name is already listed. Please contact an administrator to confirm your account or have your link resent.'
       );
     }
 
@@ -676,15 +687,29 @@ function hasTwilioConfiguration_() {
   );
 }
 
-function findDuplicateRegistration_(values, email, phone) {
-  return values.some(function (row) {
+function findRegistrationConflict_(values, name, email, phone) {
+  const normalizedName = normalizeNameForComparison_(name);
+  let nameMatch = false;
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
     const existingPhone = normalizePhone_(row[2]);
     const existingEmail = normalizeEmail_(row[7]);
-    return Boolean(
+    if (
       (email && existingEmail && email === existingEmail) ||
       (phone && existingPhone && phone === existingPhone)
-    );
-  });
+    ) {
+      return 'contact';
+    }
+    if (
+      normalizedName &&
+      normalizedName === normalizeNameForComparison_(row[1])
+    ) {
+      nameMatch = true;
+    }
+  }
+
+  return nameMatch ? 'name' : '';
 }
 
 function enforceDailyRegistrationLimit_() {
@@ -732,6 +757,13 @@ function normalizeEmail_(value) {
 function normalizeName_(value) {
   const name = String(value || '').trim().replace(/\s+/g, ' ');
   return /^[\p{L}\p{M}][\p{L}\p{M}\s.'’\-]{0,99}$/u.test(name) ? name : '';
+}
+
+function normalizeNameForComparison_(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
 }
 
 function isValidEmail_(email) {

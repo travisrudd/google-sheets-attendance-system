@@ -96,8 +96,10 @@ not configured and asks them to choose email.
    creates the Person ID and token, and adds the person to `People`.
 4. Their private link and setup instructions are delivered automatically.
 
-The `People` sheet now includes **Email** and **Delivery Method** columns. A
-duplicate email address or mobile number is not registered again.
+The `People` sheet now includes **Email** and **Delivery Method** columns.
+Registration is stopped when the email or normalized mobile number already
+exists. An exact name match is also held for administrator confirmation, which
+protects older manually entered rows that may not contain an email address.
 
 ## 7. Register people manually
 

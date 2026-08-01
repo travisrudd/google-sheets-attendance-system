@@ -38,6 +38,7 @@ or staff-operated scanner in a future version.
 
 Do not make the Google Sheet public. Only administrators need access to it.
 
-Public registration includes duplicate email/phone checks, a configurable daily
-limit, and a bot-trap field. SMS delivery requires a Twilio account; credentials
-are stored in Apps Script Properties and are never committed to this repository.
+Public registration includes duplicate email/phone checks, exact-name conflict
+review, a configurable daily limit, and a bot-trap field. SMS delivery requires
+a Twilio account; credentials are stored in Apps Script Properties and are never
+committed to this repository.
